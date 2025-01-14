@@ -1,9 +1,10 @@
-""""
+"""
 Forced Alignment with Whisper
 C. Max Bain
 """
+
 from dataclasses import dataclass
-from typing import Iterable, Union, List, Callable
+from typing import Iterable, Optional, Union, List
 
 import numpy as np
 import pandas as pd
@@ -13,8 +14,13 @@ from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
 from .audio import SAMPLE_RATE, load_audio
 from .utils import interpolate_nans
-from .types import AlignedTranscriptionResult, SingleSegment, SingleAlignedSegment, SingleWordSegment
-import nltk
+from .types import (
+    AlignedTranscriptionResult,
+    SingleSegment,
+    SingleAlignedSegment,
+    SingleWordSegment,
+    SegmentData,
+)
 from nltk.tokenize.punkt import PunktSentenceTokenizer, PunktParameters
 
 PUNKT_ABBREVIATIONS = ['dr', 'vs', 'mr', 'mrs', 'prof']
@@ -53,12 +59,19 @@ DEFAULT_ALIGN_MODELS_HF = {
     "hi": "theainerd/Wav2Vec2-large-xlsr-hindi",
     "ca": "softcatala/wav2vec2-large-xlsr-catala",
     "ml": "gvs/wav2vec2-large-xlsr-malayalam",
-    "no": "NbAiLab/nb-wav2vec2-1b-bokmaal",
-    "nn": "NbAiLab/nb-wav2vec2-300m-nynorsk",
+    "no": "NbAiLab/nb-wav2vec2-1b-bokmaal-v2",
+    "nn": "NbAiLab/nb-wav2vec2-1b-nynorsk",
+    "sk": "comodoro/wav2vec2-xls-r-300m-sk-cv8",
+    "sl": "anton-l/wav2vec2-large-xlsr-53-slovenian",
+    "hr": "classla/wav2vec2-xls-r-parlaspeech-hr",
+    "ro": "gigant/romanian-wav2vec2",
+    "eu": "stefan-it/wav2vec2-large-xlsr-53-basque",
+    "gl": "ifrz/wav2vec2-large-xlsr-galician",
+    "ka": "xsway/wav2vec2-large-xlsr-georgian",
 }
 
 
-def load_align_model(language_code, device, model_name=None, model_dir=None):
+def load_align_model(language_code: str, device: str, model_name: Optional[str] = None, model_dir=None):
     if model_name is None:
         # use default model
         if language_code in DEFAULT_ALIGN_MODELS_TORCH:
@@ -78,8 +91,8 @@ def load_align_model(language_code, device, model_name=None, model_dir=None):
         align_dictionary = {c.lower(): i for i, c in enumerate(labels)}
     else:
         try:
-            processor = Wav2Vec2Processor.from_pretrained(model_name)
-            align_model = Wav2Vec2ForCTC.from_pretrained(model_name)
+            processor = Wav2Vec2Processor.from_pretrained(model_name, cache_dir=model_dir)
+            align_model = Wav2Vec2ForCTC.from_pretrained(model_name, cache_dir=model_dir)
         except Exception as e:
             print(e)
             print(f"Error loading model from huggingface, check https://huggingface.co/models for finetuned wav2vec2.0 models")
@@ -104,7 +117,6 @@ def align(
     return_char_alignments: bool = False,
     print_progress: bool = False,
     combined_progress: bool = False,
-    on_progress: Callable[[int, int], None] = None
 ) -> AlignedTranscriptionResult:
     """
     Align phoneme recognition predictions to known transcription.
@@ -125,15 +137,14 @@ def align(
 
     # 1. Preprocess to keep only characters in dictionary
     total_segments = len(transcript)
+    # Store temporary processing values
+    segment_data: dict[int, SegmentData] = {}
     for sdx, segment in enumerate(transcript):
         # strip spaces at beginning / end, but keep track of the amount.
         if print_progress:
             base_progress = ((sdx + 1) / total_segments) * 100
             percent_complete = (50 + base_progress / 2) if combined_progress else base_progress
             print(f"Progress: {percent_complete:.2f}%...")
-
-        if on_progress:
-            on_progress(sdx + 1, total_segments)
             
         num_leading = len(segment["text"]) - len(segment["text"].lstrip())
         num_trailing = len(segment["text"]) - len(segment["text"].rstrip())
@@ -172,11 +183,13 @@ def align(
         sentence_splitter = PunktSentenceTokenizer(punkt_param)
         sentence_spans = list(sentence_splitter.span_tokenize(text))
 
-        segment["clean_char"] = clean_char
-        segment["clean_cdx"] = clean_cdx
-        segment["clean_wdx"] = clean_wdx
-        segment["sentence_spans"] = sentence_spans
-    
+        segment_data[sdx] = {
+            "clean_char": clean_char,
+            "clean_cdx": clean_cdx,
+            "clean_wdx": clean_wdx,
+            "sentence_spans": sentence_spans
+        }
+            
     aligned_segments: List[SingleAlignedSegment] = []
     
     # 2. Get prediction matrix from alignment model & align
@@ -191,13 +204,14 @@ def align(
             "end": t2,
             "text": text,
             "words": [],
+            "chars": None,
         }
 
         if return_char_alignments:
             aligned_seg["chars"] = []
 
         # check we can align
-        if len(segment["clean_char"]) == 0:
+        if len(segment_data[sdx]["clean_char"]) == 0:
             print(f'Failed to align segment ("{segment["text"]}"): no characters in this segment found in model dictionary, resorting to original...')
             aligned_segments.append(aligned_seg)
             continue
@@ -207,7 +221,7 @@ def align(
             aligned_segments.append(aligned_seg)
             continue
 
-        text_clean = "".join(segment["clean_char"])
+        text_clean = "".join(segment_data[sdx]["clean_char"])
         tokens = [model_dictionary[c] for c in text_clean]
 
         f1 = int(t1 * SAMPLE_RATE)
@@ -258,8 +272,8 @@ def align(
         word_idx = 0
         for cdx, char in enumerate(text):
             start, end, score = None, None, None
-            if cdx in segment["clean_cdx"]:
-                char_seg = char_segments[segment["clean_cdx"].index(cdx)]
+            if cdx in segment_data[sdx]["clean_cdx"]:
+                char_seg = char_segments[segment_data[sdx]["clean_cdx"].index(cdx)]
                 start = round(char_seg.start * ratio + t1, 3)
                 end = round(char_seg.end * ratio + t1, 3)
                 score = round(char_seg.score, 3)
@@ -285,10 +299,10 @@ def align(
         aligned_subsegments = []
         # assign sentence_idx to each character index
         char_segments_arr["sentence-idx"] = None
-        for sdx, (sstart, send) in enumerate(segment["sentence_spans"]):
+        for sdx2, (sstart, send) in enumerate(segment_data[sdx]["sentence_spans"]):
             curr_chars = char_segments_arr.loc[(char_segments_arr.index >= sstart) & (char_segments_arr.index <= send)]
-            char_segments_arr.loc[(char_segments_arr.index >= sstart) & (char_segments_arr.index <= send), "sentence-idx"] = sdx
-        
+            char_segments_arr.loc[(char_segments_arr.index >= sstart) & (char_segments_arr.index <= send), "sentence-idx"] = sdx2
+
             sentence_text = text[sstart:send]
             sentence_start = curr_chars["start"].min()
             end_chars = curr_chars[curr_chars["char"] != ' ']
@@ -335,11 +349,8 @@ def align(
                 aligned_subsegments[-1]["chars"] = curr_chars
 
         aligned_subsegments = pd.DataFrame(aligned_subsegments)
-        # fix nans of start/end
-        seq_timecode_vals = aligned_subsegments[["start", "end"]].values.ravel("C")
-        filled_seq_timecodes = interpolate_nans(pd.Series(seq_timecode_vals), method=interpolate_method)
-        aligned_subsegments["start"] = filled_seq_timecodes.iloc[::2].values
-        aligned_subsegments["end"] = filled_seq_timecodes.iloc[1::2].values
+        aligned_subsegments["start"] = interpolate_nans(aligned_subsegments["start"], method=interpolate_method)
+        aligned_subsegments["end"] = interpolate_nans(aligned_subsegments["end"], method=interpolate_method)
         # concatenate sentences with same timestamps
         agg_dict = {"text": " ".join, "words": "sum"}
         if model_lang in LANGUAGES_WITHOUT_SPACES:
